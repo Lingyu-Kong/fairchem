@@ -382,6 +382,197 @@ class EqV2DeNSBackbone(EquiformerV2Backbone):
         return {"node_embedding": x, "graph": graph}
 
 
+@registry.register_model("eqV2_DeNS_scalar_head")
+class DeNSScalarHead(torch.nn.Module, HeadInterface):
+    def __init__(
+        self,
+        backbone: BackboneInterface,
+        output_name: str = "energy",
+        reduce: Literal["sum", "mean"] = "sum",
+        use_denoising: bool = True,
+    ):
+        """
+        Args:
+            backbone: Model backbone
+            output_name: property output name
+            reduce: reduction, mean or sum. Use mean for intensive properties and sum for extensive ones.
+            use_denoising: For ablation study, whether to predict the energy of the original structure given
+                a corrupted structure. If `False`, we zero out the energy prediction. Default: True.
+        """
+        super().__init__()
+        self.reduce = reduce
+        self.avg_num_nodes = backbone.avg_num_nodes
+        self.scalar_block = FeedForwardNetwork(
+            backbone.sphere_channels,
+            backbone.ffn_hidden_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_grid,
+            backbone.ffn_activation,
+            backbone.use_gate_act,
+            backbone.use_grid_mlp,
+            backbone.use_sep_s2_act,
+        )
+        self.output_name = output_name
+        self.apply(partial(eqv2_init_weights, weight_init=backbone.weight_init))
+        self.use_denoising = use_denoising
+
+    def forward(
+        self, data: Batch, emb: dict[str, torch.Tensor | GraphData]
+    ) -> dict[str, torch.Tensor]:
+        node_out = self.scalar_block(emb["node_embedding"])
+        node_out = node_out.embedding.narrow(1, 0, 1)
+        if gp_utils.initialized():
+            node_out = gp_utils.gather_from_model_parallel_region(node_out, dim=0)
+        output_scalar = torch.zeros(
+            len(data.natoms),
+            device=node_out.device,
+            dtype=node_out.dtype,
+        )
+
+        output_scalar.index_add_(0, data.batch, node_out.view(-1))
+
+        if (
+            hasattr(data, "denoising_pos_forward")
+            and data.denoising_pos_forward
+            and not self.use_denoising
+        ):
+            output_scalar = output_scalar * 0.0
+
+        if self.reduce == "sum":
+            return {self.output_name: output_scalar / self.avg_num_nodes}
+        elif self.reduce == "mean":
+            return {self.output_name: output_scalar / data.natoms}
+        else:
+            raise ValueError(
+                f"reduce can only be sum or mean, user provided: {self.reduce}"
+            )
+
+
+@registry.register_model("eqV2_DeNS_vector_head")
+class DeNSVectorHead(torch.nn.Module, HeadInterface):
+    def __init__(self, backbone: BackboneInterface, output_name: str = "forces"):
+        super().__init__()
+
+        self.output_name = output_name
+        self.activation_checkpoint = backbone.activation_checkpoint
+
+        self.vector_block = SO2EquivariantGraphAttention(
+            backbone.sphere_channels,
+            backbone.attn_hidden_channels,
+            backbone.num_heads,
+            backbone.attn_alpha_channels,
+            backbone.attn_value_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_rotation,
+            backbone.mappingReduced,
+            backbone.SO3_grid,
+            backbone.max_num_elements,
+            backbone.edge_channels_list,
+            backbone.block_use_atom_edge_embedding,
+            backbone.use_m_share_rad,
+            backbone.attn_activation,
+            backbone.use_s2_act_attn,
+            backbone.use_attn_renorm,
+            backbone.use_gate_act,
+            backbone.use_sep_s2_act,
+            alpha_drop=0.0,
+        )
+
+        self.denoising_pos_block = SO2EquivariantGraphAttention(
+            backbone.sphere_channels,
+            backbone.attn_hidden_channels,
+            backbone.num_heads,
+            backbone.attn_alpha_channels,
+            backbone.attn_value_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_rotation,
+            backbone.mappingReduced,
+            backbone.SO3_grid,
+            backbone.max_num_elements,
+            backbone.edge_channels_list,
+            backbone.block_use_atom_edge_embedding,
+            backbone.use_m_share_rad,
+            backbone.attn_activation,
+            backbone.use_s2_act_attn,
+            backbone.use_attn_renorm,
+            backbone.use_gate_act,
+            backbone.use_sep_s2_act,
+            alpha_drop=0.0,
+        )
+        self.apply(partial(eqv2_init_weights, weight_init=backbone.weight_init))
+
+    def forward(
+        self, data: Batch, emb: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        if self.activation_checkpoint:
+            output_vector = torch.utils.checkpoint.checkpoint(
+                self.vector_block,
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                emb["graph"].node_offset,
+                use_reentrant=not self.training,
+            )
+            denoising_pos_vec = torch.utils.checkpoint.checkpoint(
+                self.denoising_pos_block,
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                emb["graph"].node_offset,
+                use_reentrant=not self.training,
+            )
+        else:
+            output_vector = self.vector_block(
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                node_offset=emb["graph"].node_offset,
+            )
+            denoising_pos_vec = self.denoising_pos_block(
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                node_offset=emb["graph"].node_offset,
+            )
+        output_vector = output_vector.embedding.narrow(1, 1, 3)
+        output_vector = output_vector.view(-1, 3).contiguous()
+        denoising_pos_vec = denoising_pos_vec.embedding.narrow(1, 1, 3)
+        denoising_pos_vec = denoising_pos_vec.view(-1, 3)
+        if gp_utils.initialized():
+            output_vector = gp_utils.gather_from_model_parallel_region(
+                output_vector, dim=0
+            )
+            denoising_pos_vec = gp_utils.gather_from_model_parallel_region(
+                denoising_pos_vec, dim=0
+            )
+
+        if hasattr(data, "denoising_pos_forward") and data.denoising_pos_forward:
+            if hasattr(data, "noise_mask"):
+                noise_mask_tensor = data.noise_mask.view(-1, 1)
+                output_vector = (
+                    denoising_pos_vec * noise_mask_tensor
+                    + output_vector * (~noise_mask_tensor)
+                )
+            else:
+                output_vector = denoising_pos_vec + 0 * output_vector
+        else:
+            output_vector = 0 * denoising_pos_vec + output_vector
+
+        return {self.output_name: output_vector}
+
+
+
+
 @registry.register_model("equiformer_v2_dens_energy_head")
 class DeNSEnergyHead(torch.nn.Module, HeadInterface):
     def __init__(self, backbone, reduce: str = "sum"):
@@ -432,6 +623,119 @@ class DeNSEnergyHead(torch.nn.Module, HeadInterface):
                 f"reduce can only be sum or mean, user provided: {self.reduce}"
             )
 
+@registry.register_model("equiformer_v2_dens_force_head")
+class DeNSForceHead(torch.nn.Module, HeadInterface):
+    def __init__(self, backbone):
+        super().__init__()
+
+        self.activation_checkpoint = backbone.activation_checkpoint
+
+        self.force_block = SO2EquivariantGraphAttention(
+            backbone.sphere_channels,
+            backbone.attn_hidden_channels,
+            backbone.num_heads,
+            backbone.attn_alpha_channels,
+            backbone.attn_value_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_rotation,
+            backbone.mappingReduced,
+            backbone.SO3_grid,
+            backbone.max_num_elements,
+            backbone.edge_channels_list,
+            backbone.block_use_atom_edge_embedding,
+            backbone.use_m_share_rad,
+            backbone.attn_activation,
+            backbone.use_s2_act_attn,
+            backbone.use_attn_renorm,
+            backbone.use_gate_act,
+            backbone.use_sep_s2_act,
+            alpha_drop=0.0,
+        )
+
+        self.denoising_pos_block = SO2EquivariantGraphAttention(
+            backbone.sphere_channels,
+            backbone.attn_hidden_channels,
+            backbone.num_heads,
+            backbone.attn_alpha_channels,
+            backbone.attn_value_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_rotation,
+            backbone.mappingReduced,
+            backbone.SO3_grid,
+            backbone.max_num_elements,
+            backbone.edge_channels_list,
+            backbone.block_use_atom_edge_embedding,
+            backbone.use_m_share_rad,
+            backbone.attn_activation,
+            backbone.use_s2_act_attn,
+            backbone.use_attn_renorm,
+            backbone.use_gate_act,
+            backbone.use_sep_s2_act,
+            alpha_drop=0.0,
+        )
+        self.apply(partial(eqv2_init_weights, weight_init=backbone.weight_init))
+
+    def forward(self, data: Batch, emb: dict[str, torch.Tensor]):
+        if self.activation_checkpoint:
+            forces = torch.utils.checkpoint.checkpoint(
+                self.force_block,
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                emb["graph"].node_offset,
+                use_reentrant=not self.training,
+            )
+            denoising_pos_vec = torch.utils.checkpoint.checkpoint(
+                self.denoising_pos_block,
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                emb["graph"].node_offset,
+                use_reentrant=not self.training,
+            )
+        else:
+            forces = self.force_block(
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                node_offset=emb["graph"].node_offset,
+            )
+            denoising_pos_vec = self.denoising_pos_block(
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                node_offset=emb["graph"].node_offset,
+            )
+        forces = forces.embedding.narrow(1, 1, 3)
+        forces = forces.view(-1, 3).contiguous()
+        denoising_pos_vec = denoising_pos_vec.embedding.narrow(1, 1, 3)
+        denoising_pos_vec = denoising_pos_vec.view(-1, 3)
+        if gp_utils.initialized():
+            forces = gp_utils.gather_from_model_parallel_region(forces, dim=0)
+            denoising_pos_vec = gp_utils.gather_from_model_parallel_region(
+                denoising_pos_vec, dim=0
+            )
+
+        if hasattr(data, "denoising_pos_forward") and data.denoising_pos_forward:
+            if hasattr(data, "noise_mask"):
+                noise_mask_tensor = data.noise_mask.view(-1, 1)
+                forces = denoising_pos_vec * noise_mask_tensor + forces * (
+                    ~noise_mask_tensor
+                )
+            else:
+                forces = denoising_pos_vec + 0 * forces
+        else:
+            forces = 0 * denoising_pos_vec + forces
+
+        return {"forces": forces}
 
 @registry.register_model("equiformer_v2_dens_force_head")
 class DeNSForceHead(torch.nn.Module, HeadInterface):
